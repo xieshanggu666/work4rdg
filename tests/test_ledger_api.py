@@ -26,6 +26,11 @@ from app.models import (
     User,
 )
 from app.services.quota_service import allocate_quota
+from app.services.trade_order_service import (
+    confirm_order,
+    create_order,
+    deliver_order,
+)
 
 
 def _install_engine(engine):
@@ -155,6 +160,63 @@ class TestLedgerQueries:
         page2 = client.get(f"/api/ledger/events?limit=1&before_seq={cursor}").json()
         assert len(page2["items"]) == 1
         assert page2["items"][0]["seq"] < cursor
+
+    def test_event_paging_cursor_no_overlap_and_real_balances(self, ctx):
+        client, ids, TS = ctx
+        # 追加一笔订单交割：2 分配 + 占用/出库/到账 = 5 条余额事件
+        db = TS()
+        o = create_order(db, ids["c1"], ids["c2"], 2026, amount=100, price=10,
+                         initiator="seller")
+        confirm_order(db, o.id, ids["c2"])
+        deliver_order(db, o.id, ids["c1"])
+        db.commit()
+        expected = {
+            acc.company_id: float(acc.current_balance)
+            for acc in db.query(AllowanceAccount).all()
+        }
+        db.close()
+
+        login(client, "admin")
+        # 一次性大页作为基准（5 条事件、limit=500：不足一页，无游标）
+        full = client.get("/api/ledger/events?limit=500").json()
+        assert full["has_more"] is False
+        assert full["next_before_seq"] is None
+        assert len(full["items"]) == 5
+
+        # limit=2 向前翻页：页间不重叠不遗漏，游标锚定每页最小 seq
+        collected = []
+        cursor = None
+        while True:
+            url = "/api/ledger/events?limit=2"
+            if cursor is not None:
+                url += f"&before_seq={cursor}"
+            body = client.get(url).json()
+            assert body["items"]
+            collected = body["items"] + collected
+            if not body["has_more"]:
+                assert body["next_before_seq"] is None
+                break
+            cursor = body["next_before_seq"]
+            assert cursor == body["items"][0]["seq"]
+        assert [i["seq"] for i in collected] == [i["seq"] for i in full["items"]]
+        for got, want in zip(collected, full["items"]):
+            assert got["balance_after"] == want["balance_after"]
+
+        # 翻页后的快照与真实账户一致：链尾每账户最后一条 == 账户当前持仓
+        last_by_acc = {}
+        for item in full["items"]:
+            if item["account_id"] is not None:
+                last_by_acc[item["company_id"]] = item
+        for company_id, balance in expected.items():
+            assert last_by_acc[company_id]["balance_after"] == balance
+
+        # 中间页（非链首）快照不从零重算：第二页首条承接页前投影
+        page2 = client.get("/api/ledger/events?limit=2&before_seq=4").json()
+        assert [i["seq"] for i in page2["items"]] == [2, 3]
+        assert page2["items"][0]["balance_after"] == 1000  # c2 分配入账后
+        # c1 的分配（seq=1）在本页之前：若从零重算这里会是 0
+        assert page2["items"][1]["balance_after"] == 1000
+        assert page2["items"][1]["reserved_after"] == 100  # c1 订单确认占用
 
     def test_account_replay(self, ctx):
         client, ids, TS = ctx

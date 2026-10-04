@@ -12,6 +12,10 @@
 记账语义天然一致；每应用一条带三余额快照的事件，可顺带校验“重放余额 == 事件
 落账时快照”，快照不符只可能源于旧数据修复/库外改动，记入差异而非中断重放。
 
+事件时间线（``replay_events_timeline``）是审计查询面：按 ``before_seq`` 游标
+向前翻页，每页快照从页前事件累计出的起始投影继续推进（而非从零重算），
+翻页、企业/年度筛选与并发新增事件下都与真实账户状态一致。
+
 事件链完整性（seq 连续 + prev_hash/chain_hash 勾连）单独由对账器校验。
 """
 
@@ -20,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.event_semantics import apply_vector, semantics_for
@@ -221,6 +226,60 @@ def rebuild_checkpoints(db: Session, *, commit: bool = True) -> dict[str, int]:
     return {"accounts": len(states)}
 
 
+# --------------------------------------------------------------------------- #
+# 事件时间线（审计查询面）
+# --------------------------------------------------------------------------- #
+
+def _timeline_scope(q, *, company_id, year, account_id):
+    """时间线统一筛选口径：页面查询与页前累计必须使用完全相同的过滤条件，
+    否则企业/年度筛选下翻页的起始投影会与页面口径不一致。"""
+    if company_id is not None:
+        q = q.filter(LedgerEvent.company_id == company_id)
+    if year is not None:
+        q = q.filter(LedgerEvent.year == year)
+    if account_id is not None:
+        q = q.filter(LedgerEvent.account_id == account_id)
+    return q
+
+
+def _opening_states(
+    db: Session,
+    *,
+    first_seq: int,
+    company_id: int | None,
+    year: int | None,
+    account_id: int | None,
+) -> dict[int, list[float]]:
+    """汇总 ``seq < first_seq``（同筛选口径）的全部余额事件，作为本页起始投影。
+
+    按 (账户, 事件类型) 聚合金额后一次性作用：投影向量对金额是线性的，
+    与逐事件重放数学等价（金额落库时已统一保留 4 位小数），
+    分页时无需逐条扫描历史事件。
+    """
+    q = (
+        db.query(
+            LedgerEvent.account_id,
+            LedgerEvent.event_type,
+            func.coalesce(func.sum(LedgerEvent.amount), 0),
+        )
+        .filter(
+            LedgerEvent.direction != "status",
+            LedgerEvent.account_id.isnot(None),
+            LedgerEvent.seq < first_seq,
+        )
+        .group_by(LedgerEvent.account_id, LedgerEvent.event_type)
+    )
+    q = _timeline_scope(q, company_id=company_id, year=year, account_id=account_id)
+    states: dict[int, list[float]] = {}
+    for acc_id, event_type, total in q.all():
+        dc, df, dr = apply_vector(event_type, float(total or 0))
+        acc = states.setdefault(acc_id, [0.0, 0.0, 0.0])
+        acc[0] = round(acc[0] + dc, 4)
+        acc[1] = round(acc[1] + df, 4)
+        acc[2] = round(acc[2] + dr, 4)
+    return states
+
+
 def replay_events_timeline(
     db: Session,
     *,
@@ -229,24 +288,40 @@ def replay_events_timeline(
     account_id: int | None = None,
     limit: int = 200,
     before_seq: int | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     """事件 → 逐笔余额演化（可追溯链路的查询面，含状态事件）。
 
-    从空投影按序计算每条事件后的累计余额，供 API/前端展示“每一笔业务发生后，
-    持仓/冻结/占用如何变化”。
+    返回 ``(items, has_more)``：页面为 ``seq < before_seq`` 的最近 ``limit`` 条
+    （未给游标即链尾一页），按 seq 升序；``has_more`` 表示之前还有更早事件，
+    此时把本页首条 seq 作为下一次的 ``before_seq`` 即可继续向前翻页。
+
+    一致性保证：
+
+    - 每条的持仓/冻结/占用快照从 **页前事件累计出的起始投影** 继续推进，
+      而不是从零重算——翻页、企业/年度筛选下快照都与真实账户状态一致；
+    - 事件 append-only 且 seq 单调递增，页查询与页前累计都锚定本页首条
+      seq，翻页间隙并发新增的事件（seq 更大）既不会进入已翻过的页，
+      也不会改变页前累计，翻页结果稳定可复现。
     """
-    q = db.query(LedgerEvent)
-    if company_id is not None:
-        q = q.filter(LedgerEvent.company_id == company_id)
-    if year is not None:
-        q = q.filter(LedgerEvent.year == year)
-    if account_id is not None:
-        q = q.filter(LedgerEvent.account_id == account_id)
+    q = _timeline_scope(
+        db.query(LedgerEvent), company_id=company_id, year=year, account_id=account_id
+    )
     if before_seq is not None:
         q = q.filter(LedgerEvent.seq < before_seq)
-    events = q.order_by(LedgerEvent.seq.desc(), LedgerEvent.id.desc()).limit(limit).all()
-    events = list(reversed(events))
-    running: dict[int, list[float]] = {}
+    # 多取一条判断是否还有更早事件；页面本身只返回 limit 条
+    rows = q.order_by(LedgerEvent.seq.desc(), LedgerEvent.id.desc()).limit(limit + 1).all()
+    has_more = len(rows) > limit
+    events = list(reversed(rows[:limit]))
+    if not events:
+        return [], False
+
+    running = _opening_states(
+        db,
+        first_seq=events[0].seq,
+        company_id=company_id,
+        year=year,
+        account_id=account_id,
+    )
     timeline: list[dict] = []
     for event in events:
         if event.account_id is not None:
@@ -279,4 +354,4 @@ def replay_events_timeline(
             "chain_hash": event.chain_hash[:12],
             "occurred_at": event.occurred_at.isoformat() if event.occurred_at else None,
         })
-    return timeline
+    return timeline, has_more

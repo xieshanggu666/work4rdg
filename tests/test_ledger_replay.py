@@ -14,7 +14,7 @@
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, func
 from sqlalchemy.orm import sessionmaker
 
 from app.core.database import Base
@@ -253,7 +253,8 @@ class TestReplay:
         c = _company(db, "C1", "甲")
         allocate_quota(db, c.id, 2025, 0, 500)
         db.commit()
-        items = replay_events_timeline(db, company_id=c.id)
+        items, has_more = replay_events_timeline(db, company_id=c.id)
+        assert not has_more
         assert items[-1]["balance_after"] == approx(500)
         assert items[-1]["domain"] == "quota"
 
@@ -271,6 +272,130 @@ class TestReplay:
         assert db.query(LedgerEvent).filter(
             LedgerEvent.direction != "status", LedgerEvent.year.is_(None)
         ).count() == 0
+
+
+# --------------------------------------------------------------------------- #
+# 事件时间线分页（before_seq 游标）
+# --------------------------------------------------------------------------- #
+
+class TestTimelinePagination:
+    """before_seq 翻页：快照必须承接页前真实投影，不从零重算。"""
+
+    def _seed_events(self, db):
+        """两企业 2025 年度各 1000 配额 + 3 笔订单交割（共 11 条余额事件）。"""
+        c1 = _company(db, "C1", "甲")
+        c2 = _company(db, "C2", "乙")
+        allocate_quota(db, c1.id, 2025, 0, 1000)
+        allocate_quota(db, c2.id, 2025, 0, 1000)
+        db.commit()
+        for _ in range(3):
+            o = create_order(db, c1.id, c2.id, 2025, amount=100, price=10,
+                             initiator="seller")
+            confirm_order(db, o.id, c2.id)
+            deliver_order(db, o.id, c1.id)
+            db.commit()
+        return c1, c2
+
+    @staticmethod
+    def _paged(db, limit, **filters):
+        """用 before_seq 逐页向前翻，拼出完整升序时间线。"""
+        collected: list[dict] = []
+        cursor = None
+        while True:
+            items, has_more = replay_events_timeline(
+                db, limit=limit, before_seq=cursor, **filters
+            )
+            collected = items + collected
+            if not has_more:
+                break
+            cursor = items[0]["seq"]
+        return collected
+
+    def test_paged_timeline_matches_full_replay(self, db):
+        self._seed_events(db)
+        full, has_more = replay_events_timeline(db, limit=500)
+        assert not has_more
+        assert len(full) > 5  # 保证小页确实跨页
+        for limit in (1, 2, 3, 4, 5):
+            paged = self._paged(db, limit)
+            # 页间不重叠、不遗漏，且逐条快照与一次性全量一致
+            assert [i["seq"] for i in paged] == [i["seq"] for i in full]
+            for got, want in zip(paged, full):
+                assert got["balance_after"] == want["balance_after"]
+                assert got["frozen_after"] == want["frozen_after"]
+                assert got["reserved_after"] == want["reserved_after"]
+
+    def test_tail_page_balances_match_actual_accounts(self, db):
+        c1, c2 = self._seed_events(db)
+        # 链尾一页（不覆盖链首）：快照必须来自页前累计而非从零
+        page, _ = replay_events_timeline(db, limit=3)
+        assert len(page) == 3
+        last_by_acc = {}
+        for item in page:
+            if item["account_id"] is not None:
+                last_by_acc[item["account_id"]] = item
+        for c in (c1, c2):
+            acc = db.query(AllowanceAccount).filter_by(
+                company_id=c.id, year=2025
+            ).one()
+            snap = last_by_acc[acc.id]
+            assert snap["balance_after"] == approx(float(acc.current_balance))
+            assert snap["reserved_after"] == approx(float(acc.reserved_balance))
+            assert snap["frozen_after"] == approx(float(acc.frozen_balance))
+
+    def test_filtered_pagination_consistency(self, db):
+        c1, c2 = self._seed_events(db)
+        allocate_quota(db, c1.id, 2026, 0, 900)
+        db.commit()
+        # 企业筛选：翻页拼接 == 同口径一次性全量
+        full_c1, _ = replay_events_timeline(db, company_id=c1.id, limit=500)
+        paged_c1 = self._paged(db, 2, company_id=c1.id)
+        assert [i["seq"] for i in paged_c1] == [i["seq"] for i in full_c1]
+        for got, want in zip(paged_c1, full_c1):
+            assert got["balance_after"] == want["balance_after"]
+        # 年度筛选：2025 账户快照不受 2026 事件影响，且与真实账户一致
+        full_2025, _ = replay_events_timeline(db, year=2025, limit=500)
+        paged_2025 = self._paged(db, 2, year=2025)
+        assert [i["seq"] for i in paged_2025] == [i["seq"] for i in full_2025]
+        acc25 = db.query(AllowanceAccount).filter_by(company_id=c1.id, year=2025).one()
+        last = [i for i in paged_2025 if i["account_id"] == acc25.id][-1]
+        assert last["balance_after"] == approx(float(acc25.current_balance))
+
+    def test_pagination_stable_when_events_arrive_between_pages(self, db):
+        c1, _ = self._seed_events(db)
+        page1, has_more = replay_events_timeline(db, limit=4)
+        assert has_more
+        cursor = page1[0]["seq"]
+        # 翻页间隙并发新增事件（append-only，seq 更大）
+        allocate_quota(db, c1.id, 2026, 0, 500)
+        db.commit()
+        new_seq = db.query(func.max(LedgerEvent.seq)).scalar()
+        # 继续向前翻完剩余页
+        rest: list[dict] = []
+        cur = cursor
+        while True:
+            items, more = replay_events_timeline(db, limit=4, before_seq=cur)
+            rest = items + rest
+            if not more:
+                break
+            cur = items[0]["seq"]
+        # 已翻页不含新事件；拼接结果与“新事件发生前”的链完全一致
+        assert all(i["seq"] != new_seq for i in rest + page1)
+        before, _ = replay_events_timeline(db, limit=500, before_seq=new_seq)
+        assert [i["seq"] for i in rest + page1] == [i["seq"] for i in before]
+        for got, want in zip(rest + page1, before):
+            assert got["balance_after"] == want["balance_after"]
+
+    def test_has_more_false_on_exact_multiple_and_empty_page(self, db):
+        self._seed_events(db)
+        total = db.query(LedgerEvent).count()
+        items, has_more = replay_events_timeline(db, limit=total)
+        assert len(items) == total
+        assert has_more is False
+        # 游标指到链首之前：空页且不再继续
+        items, has_more = replay_events_timeline(db, before_seq=1)
+        assert items == []
+        assert has_more is False
 
 
 # --------------------------------------------------------------------------- #

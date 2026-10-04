@@ -155,6 +155,76 @@ class TestLedgerQueries:
         page2 = client.get(f"/api/ledger/events?limit=1&before_seq={cursor}").json()
         assert len(page2["items"]) == 1
         assert page2["items"][0]["seq"] < cursor
+        assert page2["has_more"] is False
+        assert page2["next_before_seq"] is None
+
+    def test_event_paging_walks_entire_chain_without_overlap(self, ctx):
+        """limit>1 翻页：游标逐页向历史推进，不重不漏走完整链，余额跨页连续。"""
+        client, ids, TS = ctx
+        # 种子已有 2 条分配事件；再补两笔流水让链更长（c1: +100/-40）
+        db = TS()
+        acc = db.query(AllowanceAccount).filter_by(company_id=ids["c1"], year=2026).one()
+        from app.services.trading_service import transfer
+
+        transfer(db, acc, 100, "buy", counterparty="市场")
+        transfer(db, acc, 40, "sell", counterparty="市场")
+        db.commit()
+        db.close()
+
+        login(client, "admin")
+        full = client.get("/api/ledger/events?limit=500").json()
+        assert full["has_more"] is False
+        assert full["next_before_seq"] is None
+        assert len(full["items"]) == 4
+
+        walked = []
+        cursor = None
+        for _ in range(10):
+            url = "/api/ledger/events?limit=2"
+            if cursor is not None:
+                url += f"&before_seq={cursor}"
+            page = client.get(url).json()
+            items = page["items"]
+            assert items
+            walked = items + walked  # 页面按时间倒序取得，前插保持全局升序
+            if not page["has_more"]:
+                assert page["next_before_seq"] is None
+                break
+            # 游标必须指向本页最旧一条，否则下一页与本页重叠
+            assert page["next_before_seq"] == items[0]["seq"]
+            cursor = page["next_before_seq"]
+        else:
+            pytest.fail("翻页未在预期次数内终止（游标未向历史推进）")
+        # 事件总数 4 = 2 页整：恰好两页走完，不产生空的尾页
+        assert [e["seq"] for e in walked] == [e["seq"] for e in full["items"]]
+        for got, want in zip(walked, full["items"]):
+            assert got["balance_after"] == want["balance_after"]
+        # c1 末条 == 真实账户 1000+100-40=1060（而非页内从零累计的 60）
+        c1_items = [e for e in walked if e["company_id"] == ids["c1"]]
+        assert c1_items[-1]["balance_after"] == 1060
+
+    def test_enterprise_year_filtered_paging(self, ctx):
+        """企业用户按年度过滤翻页：只见本企业该年度事件，余额为真实累计。"""
+        client, ids, TS = ctx
+        db = TS()
+        allocate_quota(db, ids["c1"], 2025, 0, 300)  # c1 跨 2025/2026 两个年度
+        db.commit()
+        db.close()
+
+        login(client, "s1")
+        page = client.get("/api/ledger/events?year=2025&limit=1").json()
+        assert page["has_more"] is False
+        assert len(page["items"]) == 1
+        item = page["items"][0]
+        assert item["company_id"] == ids["c1"] and item["year"] == 2025
+        assert item["balance_after"] == 300
+
+        page26 = client.get("/api/ledger/events?year=2026&limit=10").json()
+        assert page26["items"]
+        assert all(
+            i["year"] == 2026 and i["company_id"] == ids["c1"] for i in page26["items"]
+        )
+        assert page26["items"][-1]["balance_after"] == 1000
 
     def test_account_replay(self, ctx):
         client, ids, TS = ctx

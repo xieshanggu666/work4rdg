@@ -253,7 +253,9 @@ class TestReplay:
         c = _company(db, "C1", "甲")
         allocate_quota(db, c.id, 2025, 0, 500)
         db.commit()
-        items = replay_events_timeline(db, company_id=c.id)
+        page = replay_events_timeline(db, company_id=c.id)
+        items = page["items"]
+        assert page["has_more"] is False
         assert items[-1]["balance_after"] == approx(500)
         assert items[-1]["domain"] == "quota"
 
@@ -271,6 +273,166 @@ class TestReplay:
         assert db.query(LedgerEvent).filter(
             LedgerEvent.direction != "status", LedgerEvent.year.is_(None)
         ).count() == 0
+
+
+# --------------------------------------------------------------------------- #
+# 时间线游标分页
+# --------------------------------------------------------------------------- #
+
+class TestTimelinePagination:
+    """before_seq 翻页：每页都是全量重放在该区间的切片，跨页连续、与账实一致。
+
+    回归背景：旧实现每页从 [0,0,0] 重新累计，翻页后的持仓/冻结/占用与真实
+    账户脱节；且游标指向本页最新一条，limit>1 时下一页与本页大面积重叠。
+    """
+
+    def _walk(self, db, limit, cursor=None, **filters):
+        """从 cursor（缺省链尾）向历史方向逐页走完全链，返回全局升序事件列表。"""
+        pages = []
+        for _ in range(1000):
+            page = replay_events_timeline(db, limit=limit, before_seq=cursor, **filters)
+            items = page["items"]
+            if not items:
+                assert page["has_more"] is False
+                break
+            pages.append((items, page["has_more"]))
+            if not page["has_more"]:
+                break
+            # 游标严格向历史方向推进，保证终止
+            next_cursor = items[0]["seq"]
+            assert cursor is None or next_cursor < cursor
+            cursor = next_cursor
+        walked = [e for items, _ in reversed(pages) for e in items]
+        return walked, pages
+
+    def test_paged_timeline_is_slice_of_full_replay(self, db):
+        c1 = _company(db, "C1", "甲")
+        c2 = _company(db, "C2", "乙")
+        allocate_quota(db, c1.id, 2025, 0, 1000)
+        allocate_quota(db, c2.id, 2025, 0, 1000)
+        db.commit()
+        # 订单确认（占用）+ 交割（占用出库/到账），让 reserved 列也跨页变化
+        o = create_order(db, c1.id, c2.id, 2025, amount=300, price=10, initiator="seller")
+        confirm_order(db, o.id, c2.id)
+        deliver_order(db, o.id, c1.id)
+        db.commit()
+        acc1 = db.query(AllowanceAccount).filter_by(company_id=c1.id, year=2025).one()
+        acc2 = db.query(AllowanceAccount).filter_by(company_id=c2.id, year=2025).one()
+
+        full = replay_events_timeline(db, limit=500)["items"]
+        assert len(full) == 5  # 2 分配 + 占用 + 出库 + 到账
+
+        walked, pages = self._walk(db, limit=2)
+        assert [len(items) for items, _ in pages] == [2, 2, 1]
+        assert [has_more for _, has_more in pages] == [True, True, False]
+        # 拼接后 == 全量时间线：seq 不重不漏，逐笔三余额一致
+        assert [e["seq"] for e in walked] == [e["seq"] for e in full]
+        for got, want in zip(walked, full):
+            assert got["balance_after"] == approx(want["balance_after"])
+            assert got["frozen_after"] == approx(want["frozen_after"])
+            assert got["reserved_after"] == approx(want["reserved_after"])
+        # 各账户末条 == 真实账户（而非页内从零累计的相对值）
+        last_by_acc = {}
+        for e in walked:
+            if e["account_id"] is not None:
+                last_by_acc[e["account_id"]] = e
+        assert last_by_acc[acc1.id]["balance_after"] == approx(700)
+        assert last_by_acc[acc1.id]["reserved_after"] == approx(0)
+        assert last_by_acc[acc2.id]["balance_after"] == approx(1300)
+        # 占用事件落在中间页：占用额同样衔接真实历史
+        reserve_ev = next(e for e in walked if e["event_type"] == "trade_reserve")
+        assert reserve_ev["reserved_after"] == approx(300)
+        assert reserve_ev["balance_after"] == approx(1000)
+
+    def test_company_year_filter_paging_is_isolated(self, db):
+        c = _company(db, "C1", "甲")
+        allocate_quota(db, c.id, 2025, 0, 500)
+        allocate_quota(db, c.id, 2026, 0, 900)
+        db.commit()
+        acc26 = db.query(AllowanceAccount).filter_by(company_id=c.id, year=2026).one()
+        from app.services.trading_service import transfer
+
+        transfer(db, acc26, 100, "buy", counterparty="市场")
+        db.commit()
+
+        # 企业+年度过滤翻页：只含该年度事件，余额与该年度账户一致，不串年度
+        walked25, _ = self._walk(db, limit=1, company_id=c.id, year=2025)
+        assert len(walked25) == 1
+        assert all(e["year"] == 2025 for e in walked25)
+        assert walked25[-1]["balance_after"] == approx(500)
+
+        walked26, pages26 = self._walk(db, limit=1, company_id=c.id, year=2026)
+        assert len(pages26) == 2  # 两页走完 2026 的两条事件
+        assert all(e["year"] == 2026 for e in walked26)
+        # 最新一页（先取到）是买入后：余额须为真实累计 1000，而非页内从零的 100
+        assert walked26[-1]["balance_after"] == approx(1000)
+        assert walked26[0]["balance_after"] == approx(900)
+
+        # 账户维度过滤与 企业+年度 过滤结果一致
+        walked_acc, _ = self._walk(db, limit=1, account_id=acc26.id)
+        assert [e["seq"] for e in walked_acc] == [e["seq"] for e in walked26]
+
+    def test_frozen_column_continuous_across_pages(self, db):
+        c = _company(db, "C", "企业")
+        allocate_quota(db, c.id, 2025, 0, 1000)
+        db.commit()
+        TestComplianceReconciliation()._approve_report(db, c, 800)  # freeze 800
+        from app.services.quota_service import clear_emission
+
+        clear_emission(db, c.id, 2025, "2025-12-31")  # 冻结核销 800 离仓
+        db.commit()
+        acc = db.query(AllowanceAccount).filter_by(company_id=c.id, year=2025).one()
+
+        # 3 条事件（allocation/freeze/frozen_clear），limit=1 逐条翻页
+        walked, pages = self._walk(db, limit=1, account_id=acc.id)
+        assert len(pages) == 3
+        freeze_ev = next(e for e in walked if e["event_type"] == "freeze")
+        assert freeze_ev["balance_after"] == approx(1000)  # 冻结不动持仓
+        assert freeze_ev["frozen_after"] == approx(800)
+        clear_ev = walked[-1]
+        assert clear_ev["event_type"] == "frozen_clear"
+        assert clear_ev["balance_after"] == approx(200)
+        assert clear_ev["frozen_after"] == approx(0)
+        assert clear_ev["balance_after"] == approx(float(acc.current_balance))
+        assert clear_ev["frozen_after"] == approx(float(acc.frozen_balance))
+
+    def test_concurrent_appends_do_not_shift_walked_pages(self, db):
+        c = _company(db, "C1", "甲")
+        allocate_quota(db, c.id, 2025, 0, 1000)
+        db.commit()
+        acc = db.query(AllowanceAccount).filter_by(company_id=c.id, year=2025).one()
+        from app.services.trading_service import transfer
+
+        transfer(db, acc, 100, "buy", counterparty="市场")
+        db.commit()
+        full_before = replay_events_timeline(db, company_id=c.id, limit=500)["items"]
+        assert len(full_before) == 2
+
+        page1 = replay_events_timeline(db, company_id=c.id, limit=1)
+        assert page1["has_more"] is True
+        assert page1["items"][0]["balance_after"] == approx(1100)
+        cursor = page1["items"][0]["seq"]
+
+        # 翻页间隙并发新增一笔（只追加到链尾，seq 单调递增）
+        transfer(db, acc, 50, "sell", counterparty="市场")
+        db.commit()
+
+        # 旧游标继续翻历史页：内容与新事件到账前完全一致
+        page2 = replay_events_timeline(db, company_id=c.id, limit=1, before_seq=cursor)
+        assert page2["has_more"] is False
+        assert [e["seq"] for e in page2["items"]] == [full_before[0]["seq"]]
+        assert page2["items"][0]["balance_after"] == approx(1000)
+        # 新事件只出现在最新一页，且余额基于真实历史累计而非页内从零
+        head = replay_events_timeline(db, company_id=c.id, limit=1)
+        assert head["items"][0]["event_type"] == "sell"
+        assert head["items"][0]["balance_after"] == approx(1050)
+
+    def test_empty_scope_returns_empty_page(self, db):
+        page = replay_events_timeline(db, limit=5)
+        assert page == {"items": [], "has_more": False}
+        # before_seq 指向不存在的未来位置也只是取到空窗口
+        page = replay_events_timeline(db, limit=5, before_seq=1)
+        assert page == {"items": [], "has_more": False}
 
 
 # --------------------------------------------------------------------------- #

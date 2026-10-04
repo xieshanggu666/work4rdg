@@ -229,24 +229,57 @@ def replay_events_timeline(
     account_id: int | None = None,
     limit: int = 200,
     before_seq: int | None = None,
-) -> list[dict]:
+) -> dict:
     """事件 → 逐笔余额演化（可追溯链路的查询面，含状态事件）。
 
-    从空投影按序计算每条事件后的累计余额，供 API/前端展示“每一笔业务发生后，
-    持仓/冻结/占用如何变化”。
+    返回 ``{"items": [...], "has_more": bool}``：
+
+    - 页面取游标 ``before_seq`` 之前最新的 ``limit`` 条，按 seq 升序返回；
+      多取一条判定 ``has_more``（不返回该条）；
+    - 每条的累计余额 **不是从零重算**：先按同一筛选口径（企业/年度/账户）
+      把页首之前的全部历史余额事件重放为起始投影，再逐笔叠加——任意一页
+      都是全量重放在该区间的切片，跨页首尾相接，末页末条与账户实际余额一致；
+    - 事件只追加且 seq 单调递增，``seq < before_seq`` 的窗口对并发新增免疫：
+      翻页过程中新到账的事件只会出现在链尾（第一页），不会插入已翻过的页面，
+      也不会改变历史页的起始投影。
     """
-    q = db.query(LedgerEvent)
-    if company_id is not None:
-        q = q.filter(LedgerEvent.company_id == company_id)
-    if year is not None:
-        q = q.filter(LedgerEvent.year == year)
-    if account_id is not None:
-        q = q.filter(LedgerEvent.account_id == account_id)
+    def _scoped(query):
+        if company_id is not None:
+            query = query.filter(LedgerEvent.company_id == company_id)
+        if year is not None:
+            query = query.filter(LedgerEvent.year == year)
+        if account_id is not None:
+            query = query.filter(LedgerEvent.account_id == account_id)
+        return query
+
+    q = _scoped(db.query(LedgerEvent))
     if before_seq is not None:
         q = q.filter(LedgerEvent.seq < before_seq)
-    events = q.order_by(LedgerEvent.seq.desc(), LedgerEvent.id.desc()).limit(limit).all()
-    events = list(reversed(events))
+    # 多取一条判断 has_more（第 limit+1 条属于下一页，不返回）
+    rows = q.order_by(LedgerEvent.seq.desc(), LedgerEvent.id.desc()).limit(limit + 1).all()
+    has_more = len(rows) > limit
+    events = list(reversed(rows[:limit]))
+
+    # 游标重放：把页首之前的历史余额事件重放为各账户起始投影。
+    # 筛选口径与页面查询完全一致，企业/年度过滤下起始投影不串账户、不串年度。
     running: dict[int, list[float]] = {}
+    if events:
+        first_seq = events[0].seq
+        seed_q = _scoped(
+            db.query(LedgerEvent).filter(
+                LedgerEvent.direction != "status",
+                LedgerEvent.seq < first_seq,
+            )
+        ).order_by(LedgerEvent.seq.asc(), LedgerEvent.id.asc())
+        for seed_event in seed_q:
+            if seed_event.account_id is None:
+                continue
+            acc = running.setdefault(seed_event.account_id, [0.0, 0.0, 0.0])
+            dc, df, dr = apply_vector(seed_event.event_type, float(seed_event.amount or 0))
+            acc[0] = round(acc[0] + dc, 4)
+            acc[1] = round(acc[1] + df, 4)
+            acc[2] = round(acc[2] + dr, 4)
+
     timeline: list[dict] = []
     for event in events:
         if event.account_id is not None:
@@ -279,4 +312,4 @@ def replay_events_timeline(
             "chain_hash": event.chain_hash[:12],
             "occurred_at": event.occurred_at.isoformat() if event.occurred_at else None,
         })
-    return timeline
+    return {"items": timeline, "has_more": has_more}

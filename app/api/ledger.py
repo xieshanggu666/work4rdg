@@ -45,7 +45,13 @@ def list_events(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """事件链时间线（分页游标 before_seq，返回按 seq 升序的一段）。"""
+    """事件链时间线（分页游标 before_seq，返回按 seq 升序的一段）。
+
+    翻页契约：``next_before_seq`` 指向本页最旧一条事件，下一页以它为
+    ``before_seq`` 继续向历史方向取；``has_more`` 为 false 时游标为 null。
+    每条事件的持仓/冻结/占用为全量重放在该时点的投影（跨页连续），
+    不是页内从零重算的相对值。
+    """
     scoped_company = _scope_for_user(user, company_id)
     if account_id is not None:
         account = db.get(AllowanceAccount, account_id)
@@ -53,12 +59,15 @@ def list_events(
             raise HTTPException(status_code=404, detail="账户不存在")
         ensure_company_access(user, account.company_id, "无权查看该账户事件")
         scoped_company = account.company_id
-    timeline = replay_events_timeline(
+    page = replay_events_timeline(
         db, company_id=scoped_company, year=year, account_id=account_id,
         limit=limit, before_seq=before_seq,
     )
-    latest_seq = timeline[-1]["seq"] if timeline else 0
-    return {"items": timeline, "next_before_seq": latest_seq or None, "has_more": len(timeline) == limit}
+    items = page["items"]
+    # 游标必须指向本页最旧一条（取 seq < 游标 的上一页）；指向最新一条会让
+    # 下一页与本页大面积重叠，审计翻页永远走不出当前窗口
+    next_cursor = items[0]["seq"] if (items and page["has_more"]) else None
+    return {"items": items, "next_before_seq": next_cursor, "has_more": page["has_more"]}
 
 
 @router.get("/accounts/{account_id}/replay")
